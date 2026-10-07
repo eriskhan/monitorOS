@@ -1,0 +1,7 @@
+[Unit]
+Description=monitorOS appliance mode
+Requires=multi-user.target
+Wants=monitorosd.service
+After=multi-user.target display-manager.service
+Conflicts=graphical.target display-manager.service
+AllowIsolate=yes

@@ -1,0 +1,30 @@
+[Unit]
+Description=monitorOS iMac supervisor
+PartOf=monitoros-appliance.target
+After=systemd-udevd.service display-manager.service
+# Boot-time hardware absence is handled inside monitorosd. Unexpected failures
+# must not exhaust a start-limit and leave the appliance permanently stopped.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+# M0 needs DRM master, module loading, and network administration.
+User=root
+Group=root
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=-/etc/monitoros/audio.env
+ExecStart=/usr/bin/monitorosd --video-worker /usr/lib/monitoros/imac5k-stream
+# Also recover a clean unexpected exit (e.g. an external SIGTERM).
+# An explicit systemctl stop still suppresses restart.
+Restart=always
+RestartSec=2
+# SIGTERM reaches both the daemon and its worker. Give the worker time to
+# restore KMS state, then kill any remaining processes after the timeout.
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+TimeoutStopSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=monitorosd
+

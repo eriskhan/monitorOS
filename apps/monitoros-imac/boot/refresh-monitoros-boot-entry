@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENTRY_NAME="monitorOS Appliance"
+CONF=/boot/limine.conf
+UKI_DIR=/boot/EFI/Linux
+
+if [[ ${EUID} -ne 0 ]]; then
+    echo "refresh-monitoros-boot-entry must run as root" >&2
+    exit 1
+fi
+
+[[ -f "$CONF" ]] || { echo "missing $CONF" >&2; exit 1; }
+command -v b2sum >/dev/null || { echo "b2sum is required" >&2; exit 1; }
+command -v objcopy >/dev/null || { echo "objcopy is required" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
+
+# monitorOS currently supports the Omarchy kernel. Prefer the newest installed
+# linux-omarchy module tree so a freshly installed kernel gets the appliance
+# entry before its first reboot.
+target_krel=""
+while IFS= read -r krel; do
+    [[ -f "/usr/lib/modules/$krel/pkgbase" ]] || continue
+    [[ "$(cat "/usr/lib/modules/$krel/pkgbase")" == "linux-omarchy" ]] || continue
+    target_krel="$krel"
+done < <(find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V)
+
+[[ -n "$target_krel" ]] || { echo "no installed linux-omarchy kernel found" >&2; exit 1; }
+pkgbase="$(cat "/usr/lib/modules/$target_krel/pkgbase")"
+uki="$UKI_DIR/omarchy_${pkgbase}.efi"
+[[ -f "$uki" ]] || { echo "missing Omarchy UKI: $uki" >&2; exit 1; }
+
+cmdline_file="$(mktemp)"
+trap 'rm -f "$cmdline_file"' EXIT
+objcopy -O binary --only-section=.cmdline "$uki" "$cmdline_file" 2>/dev/null || true
+[[ -s "$cmdline_file" ]] || { echo "could not read embedded kernel cmdline from $uki" >&2; exit 1; }
+cmdline="$(tr -d '\0' < "$cmdline_file" | sed 's/[[:space:]]*$//')"
+
+# Keep the ordinary Omarchy UKI untouched. The appliance entry reuses its
+# hardware/kernel parameters, but suppresses Plymouth and selects the dedicated
+# monitorOS systemd target.
+cmdline="$(python3 - "$cmdline" <<'PY'
+import shlex, sys
+parts = shlex.split(sys.argv[1])
+parts = [
+    p for p in parts
+    if not p.startswith("systemd.unit=") and p != "splash"
+]
+parts.append("systemd.unit=monitoros-appliance.target")
+print(" ".join(parts))
+PY
+)"
+
+hash="$(b2sum "$uki" | awk '{print $1}')"
+block="$(cat <<EOF2
+/${ENTRY_NAME}
+comment: monitorOS appliance mode (managed by install-imac)
+protocol: efi
+path: boot():/EFI/Linux/$(basename "$uki")#${hash}
+cmdline: ${cmdline}
+EOF2
+)"
+
+python3 - "$CONF" "$ENTRY_NAME" "$block" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+entry = sys.argv[2]
+block = sys.argv[3]
+lines = path.read_text().splitlines()
+
+# Remove the previous top-level monitorOS block while preserving every other
+# generated or hand-maintained Limine entry.
+out = []
+i = 0
+marker = f"/{entry}"
+while i < len(lines):
+    if lines[i].strip() == marker:
+        i += 1
+        while i < len(lines) and not lines[i].startswith("/"):
+            i += 1
+        while out and not out[-1].strip():
+            out.pop()
+        continue
+    out.append(lines[i])
+    i += 1
+
+# monitorOS should be the unattended default. Limine quiet mode keeps its UI
+# hidden during autoboot while still allowing a keypress to reveal the recovery
+# menu. Disabling remembered-entry state keeps a one-off recovery boot from
+# changing the next power-on.
+def set_directive(name: str, value: str) -> None:
+    global out
+    replacement = f"{name}: {value}"
+    for idx, line in enumerate(out):
+        if line.startswith(name + ":"):
+            out[idx] = replacement
+            return
+    out.insert(0, replacement)
+
+set_directive("quiet", "yes")
+set_directive("remember_last_entry", "no")
+set_directive("default_entry", entry)
+
+text = "\n".join(out).rstrip() + "\n\n" + block.rstrip() + "\n"
+path.write_text(text)
+PY
+
+# Limine >=10.3 uses the first config in its search order. Old shadow copies
+# would hide /boot/limine.conf and make the new default appear ineffective.
+for stale in \
+    /boot/EFI/limine/limine.conf \
+    /boot/EFI/BOOT/limine.conf \
+    /boot/boot/limine/limine.conf \
+    /boot/limine/limine.conf; do
+    [[ "$stale" == "$CONF" ]] && continue
+    rm -f -- "$stale"
+done
+
+sync
+printf 'monitorOS: refreshed Limine entry for %s (%s)\n' "$target_krel" "$(basename "$uki")"

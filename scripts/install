@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="eriskhan/monitorOS"
+LATEST_RELEASE="https://github.com/$REPO/releases/latest"
+
+say()  { printf '\033[1;35mmonitorOS\033[0m  %s\n' "$*"; }
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+[[ "$(uname -s)" == "Linux" ]] || die "the iMac installer must be run on Linux"
+[[ ${EUID:-$(id -u)} -ne 0 ]] ||
+    die "run the installer as your normal user; it will use sudo when needed"
+[[ -r /dev/tty && -w /dev/tty ]] ||
+    die "installation must be started from an interactive terminal"
+
+for tool in curl tar mktemp; do
+    command -v "$tool" >/dev/null 2>&1 ||
+        die "required bootstrap tool '$tool' is not available"
+done
+
+say "resolving latest release"
+if ! release_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' "$LATEST_RELEASE")"; then
+    die "could not resolve the latest monitorOS release"
+fi
+release_prefix="https://github.com/$REPO/releases/tag/"
+[[ "$release_url" == "$release_prefix"* ]] ||
+    die "could not resolve the latest monitorOS release"
+
+tag="${release_url#"$release_prefix"}"
+[[ "$tag" =~ ^[A-Za-z0-9._-]+$ ]] ||
+    die "latest release returned an unexpected tag: $tag"
+
+workdir="$(mktemp -d "${TMPDIR:-/tmp}/monitoros-install.XXXXXX")"
+cleanup() {
+    rm -rf "$workdir"
+}
+trap cleanup EXIT INT TERM
+
+archive="$workdir/monitorOS.tar.gz"
+say "downloading monitorOS $tag"
+if ! curl -fL --retry 3 "https://github.com/$REPO/archive/refs/tags/$tag.tar.gz" -o "$archive"; then
+    die "could not download monitorOS $tag"
+fi
+
+tar -xzf "$archive" -C "$workdir"
+
+source_dir=""
+for candidate in "$workdir"/*; do
+    [[ -d "$candidate" ]] || continue
+    if [[ -f "$candidate/Cargo.toml" && -f "$candidate/scripts/install-imac" ]]; then
+        source_dir="$candidate"
+        break
+    fi
+done
+
+[[ -n "$source_dir" ]] ||
+    die "release archive does not contain a monitorOS source tree"
+
+say "starting interactive installer"
+MONITOROS_REVISION="$tag" bash "$source_dir/scripts/install-imac" </dev/tty

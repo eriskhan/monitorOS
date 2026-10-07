@@ -1,0 +1,510 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PATCH_REPO=https://github.com/ahmadtv/omarchy-imac18-3.git
+PATCH_PIN=43e7ccd851d5c53d2d66bd4ee163bb8da6a6c047
+PATCH_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/monitorOS/omarchy-imac18-3"
+AUDIO_DKMS=snd_hda_macbookpro
+AUDIO_DKMS_VER=0.2
+REFRESH_SOURCE="$ROOT/apps/monitoros-imac/boot/refresh-monitoros-boot-entry"
+HOOK_SOURCE="$ROOT/apps/monitoros-imac/boot/95-monitoros-appliance-entry"
+OBSERVATION_DIR="$HOME/.monitoros-observation"
+
+say()  { printf '\033[1;35mmonitorOS\033[0m  %s\n' "$*"; }
+warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+confirm() {
+    local prompt=$1 default=${2:-no} answer
+    if [[ $default == yes ]]; then
+        read -r -p "$prompt [Y/n] " answer || true
+        [[ -z $answer || $answer == [yY]* ]]
+    else
+        read -r -p "$prompt [y/N] " answer || true
+        [[ $answer == [yY]* ]]
+    fi
+}
+
+record_analytics_start() {
+    mkdir -p "$OBSERVATION_DIR"
+    date -u '+%Y-%m-%dT%H:%M:%SZ' > "$OBSERVATION_DIR/start.txt"
+    if [[ -n ${MONITOROS_REVISION:-} ]]; then
+        printf '%s\n' "$MONITOROS_REVISION" > "$OBSERVATION_DIR/git-head.txt"
+    elif git -C "$ROOT" rev-parse HEAD > "$OBSERVATION_DIR/git-head.txt" 2>/dev/null; then
+        :
+    else
+        printf 'unknown\n' > "$OBSERVATION_DIR/git-head.txt"
+    fi
+}
+
+
+[[ ${EUID} -ne 0 ]] || die "run ./scripts/install-imac as your normal user; it will use sudo when needed"
+[[ -t 0 ]] || die "install-imac is interactive and must be run from a terminal"
+[[ -f "$ROOT/Cargo.toml" ]] || die "run this command from a monitorOS checkout"
+
+product="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
+[[ "$product" == "iMac18,3" ]] || die "only iMac18,3 is supported (detected: ${product:-unknown})"
+
+[[ -r /etc/os-release ]] || die "cannot identify the operating system"
+# shellcheck disable=SC1091
+source /etc/os-release
+# Current Omarchy identifies itself as ID=omarchy, ID_LIKE=arch. Older
+# installations may still identify directly as Arch, so accept either form and
+# let the Omarchy-specific kernel/Limine checks below enforce the actual target.
+case " ${ID:-} ${ID_LIKE:-} " in
+    *" omarchy "*|*" arch "*) ;;
+    *) die "this installer currently supports Omarchy/Arch only (detected ID=${ID:-unknown} ID_LIKE=${ID_LIKE:-none})" ;;
+esac
+command -v pacman >/dev/null || die "pacman is required"
+pacman -Q linux-omarchy >/dev/null 2>&1 || die "linux-omarchy is required; update to the supported Omarchy kernel first"
+
+say "target: iMac18,3 on Omarchy"
+
+collect_analytics=0
+printf '\n'
+if confirm "  [ ] Collect analytics (local performance logs; no automatic upload)" no; then
+    collect_analytics=1
+    say "[x] Collect analytics"
+else
+    say "[ ] Collect analytics"
+fi
+
+# /boot is root-only on the qualified Omarchy/iMac layout, so authenticate
+# before probing Limine. The installer itself must still run as the normal user
+# because HOME/XDG paths and user-scoped audio configuration belong to them.
+sudo -v
+sudo test -f /boot/limine.conf || die "Omarchy Limine configuration was not found at /boot/limine.conf"
+limine_entry_existed=0
+if sudo grep -Fxq '/monitorOS Appliance' /boot/limine.conf; then
+    limine_entry_existed=1
+fi
+if ! sudo test -f /etc/default/limine; then
+    warn "/etc/default/limine is absent; treating this as an older/existing Omarchy install"
+    warn "normal monitorOS update/install can continue; applying a missing 5K patch may require the generated Limine defaults file"
+fi
+
+say "preparing Omarchy package repositories"
+# Fresh Omarchy ISO installs can boot with the final pacman.conf already in
+# place but without synchronized repository databases under /var/lib/pacman/sync.
+# In that state every ordinary pacman -S emits "database file ... does not
+# exist" followed by a wall of "target not found" errors. Do not paper over
+# that with pacman -Sy: Arch does not support partial upgrades. Use Omarchy's
+# own refresh path, which restores the selected channel configuration and runs
+# the full synchronized package upgrade transaction.
+if ! pacman -Si git >/dev/null 2>&1; then
+    command -v omarchy-refresh-pacman >/dev/null 2>&1 ||
+        die "pacman repository databases are unavailable and omarchy-refresh-pacman is missing"
+    channel=stable
+    if command -v omarchy-channel-current >/dev/null 2>&1; then
+        detected_channel="$(omarchy-channel-current 2>/dev/null || true)"
+        case "$detected_channel" in
+            stable|rc|edge) channel="$detected_channel" ;;
+        esac
+    fi
+    say "package databases are not ready; refreshing Omarchy channel: $channel"
+    omarchy-refresh-pacman "$channel"
+fi
+pacman -Si git >/dev/null 2>&1 ||
+    die "Omarchy package repositories are still unavailable after refresh"
+
+say "installing build/runtime prerequisites"
+packages=(
+    base-devel git pkgconf libdrm mesa libglvnd iproute2 kmod
+    dkms patch wget tar bc pahole flex bison zstd curl python
+    alsa-utils alsa-lib libsamplerate
+    pipewire pipewire-audio pipewire-alsa wireplumber
+)
+command -v cargo >/dev/null 2>&1 || packages+=(rust)
+command -v ufw >/dev/null 2>&1 || packages+=(ufw)
+
+# Resolve every requested target before starting the transaction. This turns a
+# future repository/package rename into one useful error instead of pacman's
+# repeated target-not-found noise.
+unavailable=()
+for pkg in "${packages[@]}"; do
+    pacman -Q "$pkg" >/dev/null 2>&1 || pacman -Si "$pkg" >/dev/null 2>&1 ||
+        unavailable+=("$pkg")
+done
+if (( ${#unavailable[@]} )); then
+    die "required packages are unavailable in the active Omarchy repositories: ${unavailable[*]}"
+fi
+sudo pacman -S --needed --noconfirm "${packages[@]}"
+
+audio_group_changed=0
+if ! getent group audio >/dev/null; then
+    die "the required audio group does not exist"
+fi
+if ! id -nG "$USER" | tr ' ' '\n' | grep -Fxq audio; then
+    say "adding $USER to the audio group for headless PipeWire access"
+    sudo usermod -aG audio "$USER"
+    audio_group_changed=1
+fi
+
+say "enabling the $USER user manager for appliance-mode PipeWire"
+sudo loginctl enable-linger "$USER"
+sudo install -d -m755 /etc/monitoros
+printf 'XDG_RUNTIME_DIR=/run/user/%s\nPIPEWIRE_REMOTE=pipewire-0\n' "$(id -u)" |
+    sudo tee /etc/monitoros/audio.env >/dev/null
+
+# The exact kernel headers matter for both the 5K amdgpu build and CS8409 DKMS.
+# Current Omarchy ships linux-omarchy-headers and even has a migration repairing
+# fresh installs that omitted them, so treat missing headers as an installer
+# error instead of silently continuing toward a late DKMS/build failure.
+if pacman -Q linux-omarchy-headers >/dev/null 2>&1; then
+    :
+elif pacman -Si linux-omarchy-headers >/dev/null 2>&1; then
+    sudo pacman -S --needed --noconfirm linux-omarchy-headers
+else
+    die "linux-omarchy-headers is unavailable in the active Omarchy repositories"
+fi
+
+newest_omarchy_kernel() {
+    local d last=""
+    for d in /usr/lib/modules/*; do
+        [[ -f "$d/pkgbase" ]] || continue
+        [[ "$(cat "$d/pkgbase")" == linux-omarchy ]] || continue
+        printf '%s\n' "$(basename "$d")"
+    done | sort -V | tail -1
+}
+
+target_krel="$(newest_omarchy_kernel)"
+[[ -n "$target_krel" ]] || die "could not locate an installed linux-omarchy module tree"
+say "kernel target: $target_krel"
+
+fivek_module_ready() {
+    local dir="/usr/lib/modules/$target_krel/kernel/drivers/gpu/drm/amd" backup module syms
+    [[ -d "$dir" ]] || return 1
+
+    # The upstream installer keeps the stock module beside the patched one.
+    # Check the installed module too: a stale backup alone is not enough to
+    # prove that the target kernel still carries the Apple dual-tile stack.
+    backup="$(find "$dir" -name 'amdgpu.ko*.stock-backup' -print -quit 2>/dev/null || true)"
+    [[ -n "$backup" ]] || return 1
+    module="$(find "$dir" -path '*/amdgpu/amdgpu.ko*' \
+        ! -name '*.stock-backup' ! -name '*.prev-*' -print -quit 2>/dev/null || true)"
+    [[ -n "$module" ]] || return 1
+
+    syms="$(zstd -dcf "$module" 2>/dev/null | strings || true)"
+    [[ "$syms" == *tiled_stitch* ]] || return 1
+    [[ "$syms" == *"panel latch"* || "$syms" == *"APPLE5K:"* ]] || return 1
+}
+
+fivek_runtime_proof() {
+    # Runtime proof is meaningful only for the kernel that is actually loaded.
+    [[ "$(uname -r)" == "$target_krel" ]] || return 2
+
+    local param connector="" connector_dir event
+    param="$(cat /sys/module/amdgpu/parameters/tiled_stitch 2>/dev/null || true)"
+    case "$param" in
+        -1|1) ;;
+        *) return 1 ;;
+    esac
+
+    # Avoid compositor-specific checks. The stitched root connector itself must
+    # advertise the complete panel mode.
+    for connector_dir in /sys/class/drm/card*-*; do
+        [[ -r "$connector_dir/status" && -r "$connector_dir/modes" ]] || continue
+        [[ "$(cat "$connector_dir/status")" == connected ]] || continue
+        grep -qx '5120x2880' "$connector_dir/modes" 2>/dev/null || continue
+        connector="$(basename "$connector_dir")"
+        break
+    done
+    [[ -n "$connector" ]] || return 1
+
+    # This is the useful tile-level proof: the stitch layer created the internal
+    # slave stream on the same CRTC. The negative event is emitted when the
+    # right tile would stay dark, so require the most recent peer-stream event
+    # to be the successful one.
+    event="$(
+        journalctl -k -b --no-pager 2>/dev/null |
+            grep -E 'TILED_STITCH: (added peer slave-tile stream|peer slave-tile stream NOT created)' |
+            tail -1 || true
+    )"
+    [[ "$event" == *"TILED_STITCH: added peer slave-tile stream"* ]] || return 1
+
+    printf '%s|%s\n' "$param" "$connector"
+}
+
+fivek_ready() {
+    fivek_module_ready
+}
+
+audio_rival_present() {
+    local conf name version
+    for conf in /usr/src/*/dkms.conf; do
+        [[ -f "$conf" ]] || continue
+        grep -qi 'BUILT_MODULE_NAME.*cs8409' "$conf" || continue
+        name="$(sed -n 's/^PACKAGE_NAME="\?\([^"[:space:]]*\)"\?.*/\1/p' "$conf" | head -1)"
+        version="$(sed -n 's/^PACKAGE_VERSION="\?\([^"[:space:]]*\)"\?.*/\1/p' "$conf" | head -1)"
+        [[ "$name" == snd_hda_macbookpro && "$version" == 0.2 ]] && continue
+        return 0
+    done
+    return 1
+}
+
+audio_dkms_registered() {
+    local dkms_out
+    dkms_out="$(dkms status 2>/dev/null || true)"
+    [[ "$dkms_out" == *snd_hda_macbookpro*"$target_krel"*installed* ]]
+}
+
+audio_module_ready() {
+    local ko dkms_out module_info
+    dkms_out="$(dkms status 2>/dev/null || true)"
+    [[ "$dkms_out" == *snd_hda_macbookpro*"$target_krel"*installed* ]] || return 1
+    ko="$(find "/usr/lib/modules/$target_krel/updates" -name 'snd-hda-codec-cs8409.ko*' -print -quit 2>/dev/null || true)"
+    [[ -n "$ko" ]] || return 1
+    module_info="$(modinfo "$ko" 2>/dev/null || true)"
+    [[ "$module_info" == *headset_buttons* ]] || return 1
+    [[ "$module_info" != *monitoros_speaker_gain_db* ]] || return 1
+    [[ "$module_info" != *monitoros_audio_overlay* ]]
+}
+
+audio_ready() {
+    audio_module_ready || return 1
+    [[ -f "$HOME/.config/wireplumber/wireplumber.conf.d/51-imac-audio-names.conf" ]] || return 1
+    ! audio_rival_present || return 1
+}
+
+audio_module_rebuilt=0
+say "checking native 5K panel and iMac audio support"
+if ! fivek_ready || ! audio_ready; then
+    say "preparing ahmadtv/omarchy-imac18-3 at the monitorOS-qualified revision"
+    mkdir -p "$(dirname "$PATCH_DIR")"
+    if [[ -d "$PATCH_DIR/.git" ]]; then
+        git -C "$PATCH_DIR" fetch --quiet origin "$PATCH_PIN"
+    else
+        rm -rf "$PATCH_DIR"
+        git clone --quiet "$PATCH_REPO" "$PATCH_DIR"
+        git -C "$PATCH_DIR" fetch --quiet origin "$PATCH_PIN"
+    fi
+    git -C "$PATCH_DIR" checkout --detach --force "$PATCH_PIN" >/dev/null
+    git -C "$PATCH_DIR" clean -fdq
+
+    # The upstream patcher is intentionally interactive. monitorOS is an
+    # opinionated appliance installer, so make only its confirmation helper
+    # honor our scoped assume-yes flag. sudo/password prompts remain real TTY
+    # prompts if the cached credential expires during a long 5K build.
+    python3 - "$PATCH_DIR/scripts/imac-patcher" <<'PY_PATCHER'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+needle = 'confirm(){ if ((HAVE_GUM)); then gum confirm "$1"; else read -rp "$1 [y/N] " a; [[ $a == [yY]* ]]; fi; }'
+replacement = """confirm(){
+    if [[ ${MONITOROS_ASSUME_YES:-0} == 1 ]]; then
+        say \"$1 yes (monitorOS appliance installer)\"
+        return 0
+    fi
+    if ((HAVE_GUM)); then gum confirm \"$1\"; else read -rp \"$1 [y/N] \" a; [[ $a == [yY]* ]]; fi
+}"""
+if needle not in s:
+    raise SystemExit("monitorOS: pinned imac-patcher confirmation helper changed; review the new upstream revision")
+s = s.replace(needle, replacement, 1)
+
+# monitorOS briefly shipped an extra TAS5764 gain overlay on top of the same
+# snd_hda_macbookpro/0.2 DKMS identity. Upstream's detector only checks the
+# headset_buttons marker, so that superseded build otherwise looks current and
+# run_module skips the forced DKMS reinstall. Reject only that old overlay here;
+# the upstream installer itself already uses dkms --force for the clean rebuild.
+audio_detector = '''audio_installed_is_ours() {   # audio_installed_is_ours <kernelrelease>
+    local ko
+    ko="$(find "/usr/lib/modules/$1/updates" -name 'snd-hda-codec-cs8409.ko*' 2>/dev/null | head -1)"
+    [[ -n $ko ]] && modinfo "$ko" 2>/dev/null | grep -q headset_buttons
+}'''
+audio_detector_replacement = '''audio_installed_is_ours() {   # audio_installed_is_ours <kernelrelease>
+    local ko module_info
+    ko="$(find "/usr/lib/modules/$1/updates" -name 'snd-hda-codec-cs8409.ko*' 2>/dev/null | head -1)"
+    [[ -n $ko ]] || return 1
+    module_info="$(modinfo "$ko" 2>/dev/null || true)"
+    [[ "$module_info" == *headset_buttons* ]] || return 1
+    [[ "$module_info" != *monitoros_speaker_gain_db* ]] || return 1
+    [[ "$module_info" != *monitoros_audio_overlay* ]]
+}'''
+if audio_detector not in s:
+    raise SystemExit("monitorOS: pinned imac-patcher audio detector changed; review the new upstream revision")
+s = s.replace(audio_detector, audio_detector_replacement, 1)
+
+p.write_text(s)
+PY_PATCHER
+
+    missing=()
+    if ! audio_ready; then
+        missing+=(audio)
+        audio_module_rebuilt=1
+    fi
+    fivek_ready || missing+=(5k)
+
+    if [[ " ${missing[*]} " == *" 5k "* ]] && ! sudo test -f /etc/default/limine; then
+        die "the native-5K patch needs applying, but /etc/default/limine is absent on this existing Omarchy install; refusing to invent a boot cmdline file"
+    fi
+
+    if [[ " ${missing[*]} " == *" 5k "* ]]; then
+        # The pinned upstream 5K installer is entered through sudo, but its
+        # linux-omarchy source reproducer deliberately runs git as SUDO_USER.
+        # On a first run, letting root create the cache parent makes that user
+        # unable to clone omarchy-pkgs into it. Pre-create/repair only this
+        # dedicated cache directory as the invoking user.
+        fivek_work="$HOME/.cache/kernel-5k-build"
+        if [[ -e "$fivek_work" && ! -d "$fivek_work" ]]; then
+            die "native-5K work path exists but is not a directory: $fivek_work"
+        fi
+        mkdir -p "$fivek_work" 2>/dev/null || true
+        if [[ ! -w "$fivek_work" ]]; then
+            say "repairing ownership of the native-5K build cache"
+            sudo chown "$(id -u):$(id -g)" "$fivek_work"
+        fi
+        [[ -w "$fivek_work" ]] || die "native-5K build cache is not writable: $fivek_work"
+    fi
+
+    if [[ " ${missing[*]} " == *" audio "* ]] &&
+       audio_dkms_registered &&
+       ! audio_module_ready; then
+        say "invalidating stale cached DKMS audio build"
+        sudo dkms remove "${AUDIO_DKMS}/${AUDIO_DKMS_VER}" --all >/dev/null 2>&1 || true
+    fi
+
+    say "applying required iMac hardware support: ${missing[*]}"
+    MONITOROS_ASSUME_YES=1 \
+        "$PATCH_DIR/scripts/imac-patcher" --apply "${missing[@]}"
+fi
+
+fivek_ready || die "native 5K support is not ready for $target_krel"
+audio_ready || die "patched CS8409 audio is not ready for $target_krel"
+
+runtime_proof=""
+if runtime_proof="$(fivek_runtime_proof)"; then
+    stitch_param="${runtime_proof%%|*}"
+    stitch_connector="${runtime_proof#*|}"
+    say "native 5K live: ${stitch_connector} exposes 5120x2880; peer tile stream is active (tiled_stitch=${stitch_param})"
+else
+    proof_rc=$?
+    if (( proof_rc == 2 )); then
+        say "native 5K patch verified for $target_krel; live tile proof will be available after booting that kernel"
+    else
+        warn "native 5K patch is installed, but this boot did not provide complete live tile proof"
+        warn "expected: a connected 5120x2880 DRM root plus a successful TILED_STITCH peer slave-tile stream event"
+    fi
+fi
+say "5K panel + CS8409 audio support verified"
+
+say "starting user PipeWire/WirePlumber"
+systemctl --user start pipewire.socket wireplumber.service ||
+    die "could not start the user PipeWire/WirePlumber services"
+
+say "setting the default PipeWire sink volume to 60%"
+pipewire_volume_ready=0
+for _ in {1..20}; do
+    if wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.6 >/dev/null 2>&1; then
+        pipewire_volume_ready=1
+        break
+    fi
+    sleep 0.25
+done
+(( pipewire_volume_ready )) ||
+    die "PipeWire started but no default audio sink became available"
+
+say "building monitorOS"
+make -C "$ROOT/apps/monitoros-imac" build
+
+was_active=0
+if systemctl is-active --quiet monitorosd.service 2>/dev/null; then
+    was_active=1
+    say "stopping the running monitorOS service for update"
+    sudo systemctl stop monitorosd.service
+fi
+
+say "installing monitorOS runtime and appliance target"
+sudo make -C "$ROOT/apps/monitoros-imac" install
+sudo systemctl daemon-reload
+sudo systemd-analyze verify \
+    /usr/lib/systemd/system/monitorosd.service \
+    /usr/lib/systemd/system/monitoros-appliance.target >/dev/null
+
+# Preserve graphical.target as the recovery behavior of the normal Omarchy boot
+# entry. The dedicated Limine entry selects monitoros-appliance.target itself.
+sudo systemctl set-default graphical.target >/dev/null
+
+say "installing persistent Limine appliance entry"
+sudo install -d -m755 /usr/lib/monitoros /etc/boot/hooks/post.d
+sudo install -m755 "$REFRESH_SOURCE" /usr/lib/monitoros/refresh-boot-entry
+sudo install -m755 "$HOOK_SOURCE" /etc/boot/hooks/post.d/95-monitoros-appliance-entry
+sudo /usr/lib/monitoros/refresh-boot-entry
+
+limine_entry_added=0
+if (( ! limine_entry_existed )) &&
+   sudo grep -Fxq '/monitorOS Appliance' /boot/limine.conf; then
+    limine_entry_added=1
+fi
+
+if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | grep -q '^Status: active'; then
+    if ! sudo ufw status 2>/dev/null | grep -E '5202.*thunderbolt0|thunderbolt0.*5202' >/dev/null; then
+        say "allowing monitorOS video on TCP/5202 over thunderbolt0"
+        sudo ufw allow in on thunderbolt0 to any port 5202 proto tcp comment 'monitorOS video'
+    else
+        say "monitorOS video firewall rule already present"
+    fi
+
+    if ! sudo ufw status 2>/dev/null | grep -E '5203.*thunderbolt0|thunderbolt0.*5203' >/dev/null; then
+        say "allowing monitorOS controls on TCP/5203 over thunderbolt0"
+        sudo ufw allow in on thunderbolt0 to any port 5203 proto tcp comment 'monitorOS control'
+    else
+        say "monitorOS control firewall rule already present"
+    fi
+
+    if ! sudo ufw status 2>/dev/null | grep -E '5204.*thunderbolt0|thunderbolt0.*5204' >/dev/null; then
+        say "allowing monitorOS speaker audio on TCP/5204 over thunderbolt0"
+        sudo ufw allow in on thunderbolt0 to any port 5204 proto tcp comment 'monitorOS speakers'
+    else
+        say "monitorOS speaker audio firewall rule already present"
+    fi
+fi
+
+# Disk encryption is deliberately outside monitorOS's scope. For unattended
+# cold boot, install Omarchy without LUKS from the start. The appliance entry
+# itself bypasses the graphical login manager by booting directly into
+# monitoros-appliance.target.
+sudo /usr/lib/monitoros/refresh-boot-entry
+
+if (( collect_analytics )); then
+    record_analytics_start
+    say "analytics collection enabled; observation marker: $OBSERVATION_DIR"
+else
+    rm -rf "$OBSERVATION_DIR"
+    say "analytics collection disabled"
+fi
+
+if (( was_active )); then
+    say "restarting monitorOS service"
+    sudo systemctl start monitorosd.service
+fi
+
+say "installation complete"
+printf '\n  Default boot entry: monitorOS Appliance\n'
+printf '  Recovery entry:     Omarchy (normal graphical.target)\n'
+printf '  Video service:      monitorosd.service\n'
+printf '  Bonjour service:    _monitoros._tcp.local.\n\n'
+
+if (( limine_entry_added || audio_module_rebuilt || audio_group_changed )); then
+    reboot_prompt="Reboot into monitorOS Appliance now?"
+    if (( audio_module_rebuilt )); then
+        say "CS8409 audio driver rebuilt; a reboot is required to load the new module"
+    fi
+    if (( audio_group_changed )); then
+        say "$USER was added to the audio group; a reboot is required for appliance-mode PipeWire access"
+    fi
+    if (( limine_entry_added )); then
+        say "new monitorOS Limine entry installed"
+    fi
+
+    if confirm "$reboot_prompt" no; then
+        sudo systemctl reboot
+    elif (( audio_module_rebuilt || audio_group_changed )); then
+        say "reboot before testing monitorOS speaker audio"
+    else
+        say "reboot when ready; the next unattended boot will select monitorOS Appliance"
+    fi
+else
+    say "monitorOS Limine entry, CS8409 driver, and audio-group access are already current; no reboot is required"
+fi

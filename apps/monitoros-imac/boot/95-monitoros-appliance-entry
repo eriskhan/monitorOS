@@ -1,0 +1,4 @@
+#!/bin/sh
+# Omarchy/limine-mkinitcpio post hook: keep monitorOS as the unattended default
+# after the generated UKI or limine.conf changes.
+exec /usr/lib/monitoros/refresh-boot-entry

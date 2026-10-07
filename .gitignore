@@ -1,0 +1,39 @@
+# Build artifacts
+build/
+out/
+dist/
+.build/
+.swiftpm/
+
+# Kernel/build trees
+linux-*/
+*.ko
+*.ko.*
+*.o
+*.a
+
+# Captures and hardware dumps
+captures/
+dumps/
+*.pcap
+*.pcapng
+
+# Local tooling
+.env
+.env.*
+.vscode/
+.idea/
+.DS_Store
+
+# Python helpers, if used
+__pycache__/
+*.py[cod]
+.venv/
+
+# Rust helpers, if used
+target/
+
+# CMake helpers, if used
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake

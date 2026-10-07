@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PKG="$ROOT/apps/device-installer-macos/dist/monitorOS.pkg"
+
+if [[ "$(uname -s)" != Darwin ]]; then
+    echo "install-device must be run on the Mac that will use the monitorOS iMac." >&2
+    exit 1
+fi
+
+for tool in swift make codesign pkgbuild pkgutil; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "install-device requires '$tool' (install Apple's Command Line Tools first)." >&2
+        exit 1
+    }
+done
+
+make -C "$ROOT/apps/device-installer-macos" verify
+
+if [[ ${1:-} == --build-only ]]; then
+    printf '%s\n' "$PKG"
+    exit 0
+fi
+if [[ $# -gt 0 ]]; then
+    echo "usage: ./scripts/install-device [--build-only]" >&2
+    exit 2
+fi
+
+open "$PKG"

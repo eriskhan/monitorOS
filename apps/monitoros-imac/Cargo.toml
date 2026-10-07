@@ -1,0 +1,14 @@
+[package]
+name = "monitoros-imac"
+version.workspace = true
+edition = "2021"
+publish = false
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+mdns-sd = { version = "=0.21.4", default-features = false }
+
+[[bin]]
+name = "monitorosd"
+path = "src/main.rs"

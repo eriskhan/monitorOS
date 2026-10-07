@@ -1,0 +1,41 @@
+#!/bin/sh
+set -eu
+
+target_volume="${3:-/}"
+controller="$target_volume/Applications/monitorOS.app"
+legacy_controller="$target_volume/Applications/monitorOS controller.app"
+utilities="$target_volume/Applications/Utilities/monitorOS"
+audio_driver="$target_volume/Library/Audio/Plug-Ins/HAL/monitorOSAudio.driver"
+
+bundle_id() {
+    /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$1/Contents/Info.plist" 2>/dev/null || true
+}
+
+remove_expected_bundle() {
+    path="$1"
+    expected_id="$2"
+
+    [ -e "$path" ] || return 0
+
+    actual_id="$(bundle_id "$path")"
+    if [ "$actual_id" != "$expected_id" ]; then
+        echo "monitorOS: refusing to replace unexpected bundle at $path (bundle id: ${actual_id:-missing})" >&2
+        exit 1
+    fi
+
+    /bin/rm -rf "$path"
+}
+
+if [ "$target_volume" = "/" ]; then
+    /usr/bin/pkill -TERM -x monitoros-controller 2>/dev/null || true
+    /usr/bin/pkill -TERM -x monitoros-helper 2>/dev/null || true
+    /bin/sleep 1
+fi
+
+remove_expected_bundle "$controller" "com.monitorOS.controller"
+remove_expected_bundle "$legacy_controller" "com.monitorOS.controller"
+remove_expected_bundle "$audio_driver" "com.monitorOS.audio"
+
+/bin/rm -rf "$utilities"
+
+exit 0

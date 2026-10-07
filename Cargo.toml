@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "apps/monitoros-imac",
+]
+resolver = "2"
+
+[workspace.package]
+# Canonical monitorOS release version. macOS packaging reads this via scripts/version.
+version = "0.1.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

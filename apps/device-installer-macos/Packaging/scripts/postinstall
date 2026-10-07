@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+target_volume="${3:-/}"
+
+if [ "$target_volume" = "/" ]; then
+    /usr/bin/killall coreaudiod 2>/dev/null || true
+fi
+
+exit 0

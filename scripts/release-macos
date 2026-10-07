@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DIST="$ROOT/apps/device-installer-macos/dist"
+PKG="$DIST/monitorOS.pkg"
+PKG_ROOT="$DIST/pkgroot"
+APP="$PKG_ROOT/Applications/monitorOS.app"
+HELPER="$APP/Contents/Helpers/monitoros-helper"
+UNINSTALLER="$PKG_ROOT/Applications/Utilities/monitorOS/Remove monitorOS.app"
+AUDIO_DRIVER="$PKG_ROOT/Library/Audio/Plug-Ins/HAL/monitorOSAudio.driver"
+NOTARY_PROFILE="${NOTARY_PROFILE:-monitorOS-notary}"
+
+say() {
+    printf 'monitorOS release  %s\n' "$*"
+}
+
+die() {
+    printf 'monitorOS release: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: ./scripts/release-macos
+
+Builds, Developer ID signs, notarizes, staples, and verifies monitorOS.pkg.
+
+Optional environment overrides:
+  APP_IDENTITY       Developer ID Application identity
+  INSTALLER_IDENTITY Developer ID Installer identity
+  TEAM_ID            Apple Developer Team ID
+  NOTARY_PROFILE     notarytool Keychain profile (default: monitorOS-notary)
+USAGE
+    exit 2
+}
+
+application_identities() {
+    security find-identity -v 2>/dev/null \
+        | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' \
+        | sort -u
+}
+
+installer_identities() {
+    security find-identity -v 2>/dev/null \
+        | sed -n 's/.*"\(Developer ID Installer:[^"]*\)".*/\1/p' \
+        | sort -u
+}
+
+identity_team_id() {
+    printf '%s\n' "$1" | sed -nE 's/.*\(([A-Z0-9]{10})\)$/\1/p'
+}
+
+select_identity() {
+    local kind="$1"
+    local supplied="$2"
+    local team_filter="$3"
+    local candidates
+    local count
+
+    if [[ -n "$supplied" ]]; then
+        if ! security find-identity -v 2>/dev/null | grep -F "\"$supplied\"" >/dev/null; then
+            die "identity is not available in Keychain: $supplied"
+        fi
+        printf '%s\n' "$supplied"
+        return
+    fi
+
+    case "$kind" in
+        application)
+            candidates="$(application_identities)"
+            ;;
+        installer)
+            candidates="$(installer_identities)"
+            ;;
+        *)
+            die "internal error: unknown identity kind '$kind'"
+            ;;
+    esac
+
+    if [[ -n "$team_filter" ]]; then
+        candidates="$(printf '%s\n' "$candidates" | grep -F "($team_filter)" || true)"
+    fi
+
+    count="$(printf '%s\n' "$candidates" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
+
+    case "$count" in
+        1)
+            printf '%s\n' "$candidates"
+            ;;
+        0)
+            if [[ -n "$team_filter" ]]; then
+                die "no Developer ID $kind identity found for Team ID $team_filter"
+            fi
+            die "no Developer ID $kind identity found in Keychain"
+            ;;
+        *)
+            printf 'monitorOS release: multiple Developer ID %s identities found:\n%s\n' \
+                "$kind" "$candidates" >&2
+            if [[ "$kind" == "application" ]]; then
+                die "set APP_IDENTITY or TEAM_ID to select one"
+            fi
+            die "set INSTALLER_IDENTITY to select one"
+            ;;
+    esac
+}
+
+verify_component() {
+    local path="$1"
+    local description="$2"
+    local details
+
+    codesign --verify --strict --verbose=2 "$path"
+    details="$(codesign -dvvv "$path" 2>&1)"
+
+    printf '%s\n' "$details" | grep -F "Authority=$APP_IDENTITY" >/dev/null \
+        || die "$description is not signed by the selected Developer ID Application identity"
+    printf '%s\n' "$details" | grep -F "TeamIdentifier=$TEAM_ID" >/dev/null \
+        || die "$description has the wrong Team ID"
+    printf '%s\n' "$details" | grep -F '(runtime)' >/dev/null \
+        || die "$description is missing hardened runtime"
+    printf '%s\n' "$details" | grep -F 'Timestamp=' >/dev/null \
+        || die "$description is missing a secure timestamp"
+}
+
+json_value() {
+    local json="$1"
+    local key="$2"
+    printf '%s\n' "$json" | plutil -extract "$key" raw -o - - 2>/dev/null || true
+}
+
+[[ $# -eq 0 ]] || usage
+VERSION="$("$ROOT/scripts/version")" \
+    || die "could not read the canonical version from Cargo.toml"
+
+[[ "$(uname -s)" == "Darwin" ]] || die "release-macos must run on macOS"
+
+for tool in git make swift security codesign pkgbuild pkgutil xcrun spctl plutil; do
+    command -v "$tool" >/dev/null 2>&1 \
+        || die "required tool '$tool' is not available"
+done
+
+if [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
+    die "working tree is not clean; commit or stash changes before creating a release"
+fi
+
+REQUESTED_TEAM_ID="${TEAM_ID:-}"
+APP_IDENTITY="$(select_identity application "${APP_IDENTITY:-}" "$REQUESTED_TEAM_ID")"
+APP_TEAM_ID="$(identity_team_id "$APP_IDENTITY")"
+[[ -n "$APP_TEAM_ID" ]] || die "could not extract Team ID from: $APP_IDENTITY"
+
+if [[ -n "$REQUESTED_TEAM_ID" && "$APP_TEAM_ID" != "$REQUESTED_TEAM_ID" ]]; then
+    die "APP_IDENTITY belongs to Team ID $APP_TEAM_ID, not $REQUESTED_TEAM_ID"
+fi
+
+TEAM_ID="$APP_TEAM_ID"
+INSTALLER_IDENTITY="$(select_identity installer "${INSTALLER_IDENTITY:-}" "$TEAM_ID")"
+INSTALLER_TEAM_ID="$(identity_team_id "$INSTALLER_IDENTITY")"
+[[ -n "$INSTALLER_TEAM_ID" ]] || die "could not extract Team ID from: $INSTALLER_IDENTITY"
+[[ "$INSTALLER_TEAM_ID" == "$TEAM_ID" ]] \
+    || die "Application and Installer identities belong to different Team IDs"
+
+say "version: $VERSION"
+say "application identity: $APP_IDENTITY"
+say "installer identity: $INSTALLER_IDENTITY"
+say "team: $TEAM_ID"
+say "notary profile: $NOTARY_PROFILE"
+
+say "checking notarization credentials"
+if ! xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
+    die "notarytool Keychain profile '$NOTARY_PROFILE' is unavailable or cannot authenticate"
+fi
+
+say "building signed package"
+make -C "$ROOT/apps/device-installer-macos" clean
+make -C "$ROOT/apps/device-installer-macos" verify \
+    CODESIGN_IDENTITY="$APP_IDENTITY" \
+    INSTALLER_IDENTITY="$INSTALLER_IDENTITY"
+
+[[ -f "$PKG" ]] || die "package was not created: $PKG"
+[[ -d "$APP" ]] || die "packaged monitorOS.app is missing"
+[[ -x "$HELPER" ]] || die "packaged monitoros-helper is missing"
+[[ -d "$UNINSTALLER" ]] || die "packaged Remove monitorOS.app is missing"
+[[ -d "$AUDIO_DRIVER" ]] || die "packaged monitorOSAudio.driver is missing"
+
+say "verifying Developer ID signatures"
+codesign --verify --deep --strict --verbose=2 "$APP"
+verify_component "$APP" "monitorOS.app"
+verify_component "$HELPER" "monitoros-helper"
+verify_component "$UNINSTALLER" "Remove monitorOS.app"
+verify_component "$AUDIO_DRIVER" "monitorOSAudio.driver"
+
+say "verifying installer package signature"
+PACKAGE_SIGNATURE="$(pkgutil --check-signature "$PKG" 2>&1)"
+printf '%s\n' "$PACKAGE_SIGNATURE"
+printf '%s\n' "$PACKAGE_SIGNATURE" | grep -F "$INSTALLER_IDENTITY" >/dev/null \
+    || die "package is not signed by the selected Developer ID Installer identity"
+
+say "submitting package to Apple notarization"
+if ! SUBMISSION_JSON="$(xcrun notarytool submit "$PKG" \
+    --keychain-profile "$NOTARY_PROFILE" \
+    --wait \
+    --output-format json)"; then
+    die "notarytool submission failed"
+fi
+
+printf '%s\n' "$SUBMISSION_JSON" | tee "$DIST/notary-submission.json"
+SUBMISSION_ID="$(json_value "$SUBMISSION_JSON" id)"
+NOTARY_STATUS="$(json_value "$SUBMISSION_JSON" status)"
+
+if [[ "$NOTARY_STATUS" != "Accepted" ]]; then
+    if [[ -n "$SUBMISSION_ID" ]]; then
+        say "notarization was not accepted; fetching Apple log"
+        xcrun notarytool log "$SUBMISSION_ID" \
+            --keychain-profile "$NOTARY_PROFILE" \
+            | tee "$DIST/notary-log.json" || true
+    fi
+    die "notarization status is '${NOTARY_STATUS:-unknown}'"
+fi
+
+say "stapling notarization ticket"
+xcrun stapler staple "$PKG"
+xcrun stapler validate "$PKG"
+
+say "running final Gatekeeper verification"
+pkgutil --check-signature "$PKG"
+spctl --assess --type install --verbose=4 "$PKG"
+
+say "release package is ready"
+printf '%s\n' "$PKG"
+if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$PKG"
+fi

@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install iMac runtime build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libdrm-dev \
+            libgbm-dev \
+            libegl-dev \
+            libgles-dev \
+            libasound2-dev \
+            libsamplerate0-dev \
+            pkg-config
+
+      - name: Validate scripts
+        run: |
+          bash -n scripts/install
+          bash -n scripts/install-imac
+          bash -n scripts/install-device
+          bash -n scripts/release-macos
+          bash -n scripts/version
+          scripts/version | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+          bash -n apps/monitoros-imac/boot/refresh-monitoros-boot-entry
+          sh -n apps/monitoros-imac/boot/95-monitoros-appliance-entry
+
+      - name: Check Rust
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-targets --all-features
+          cargo run --quiet -p monitoros-imac --bin monitorosd -- --self-test
+
+      - name: Build and self-test iMac runtime
+        run: |
+          make -C apps/monitoros-imac/video stream
+          make -C apps/monitoros-imac/video stream-test
+          cargo build --release -p monitoros-imac
+          make -C apps/monitoros-imac install-test
+          make -C apps/monitoros-imac service-test
+
+  macos:
+    needs: linux
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test helper package
+        run: swift test --package-path apps/helper-macos
+
+      - name: Build and self-test helper
+        run: |
+          swift build -c release --package-path apps/helper-macos
+          swift run -c release --package-path apps/helper-macos monitoros-helper --self-test
+
+      - name: Build controller
+        run: swift build -c release --package-path apps/controller-macos
+
+      - name: Build and verify audio driver
+        run: make -C apps/audio-driver-macos verify
+
+      - name: Build and verify macOS package
+        run: make -C apps/device-installer-macos verify
